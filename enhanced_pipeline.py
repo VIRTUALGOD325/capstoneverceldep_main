@@ -1,0 +1,757 @@
+"""
+Enhanced pipeline for DocInsight
+
+Cleaned, simplified, and integrated pipeline with scoring aggregation.
+Prepared for future DB integration.
+"""
+
+import os
+import json
+import logging
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+import tempfile
+import html
+
+# Third-party imports
+import numpy as np
+try:
+    import faiss  # type: ignore
+    FAISS_AVAILABLE = True
+except Exception:  # pragma: no cover
+    faiss = None
+    FAISS_AVAILABLE = False
+from sentence_transformers import SentenceTransformer, CrossEncoder
+import spacy
+import textstat
+import nltk
+from nltk.tokenize import sent_tokenize
+import docx2txt
+import fitz  # PyMuPDF
+
+# Local imports
+from config import *
+from scoring.core import SentenceClassifier, analyze_document_originality
+
+# Setup logging
+logging.basicConfig(level=getattr(logging, LOG_LEVEL), format=LOG_FORMAT)
+logger = logging.getLogger(__name__)
+
+
+class TextExtractor:
+    """Handles text extraction from various file formats"""
+    
+    @staticmethod
+    def extract_text_from_pdf(path: str) -> str:
+        """Extract text from PDF file"""
+        try:
+            text_parts = []
+            doc = fitz.open(path)
+            for page in doc:
+                text_parts.append(page.get_text())
+            doc.close()
+            return "\n".join(text_parts)
+        except Exception as e:
+            logger.error(f"Error extracting text from PDF {path}: {e}")
+            raise
+    
+    @staticmethod
+    def extract_text(path: str) -> str:
+        """Extract text from supported file formats"""
+        path = str(path)
+        ext = Path(path).suffix.lower()
+        
+        if ext not in SUPPORTED_EXTENSIONS:
+            raise ValueError(f'Unsupported file type: {ext}. Supported: {SUPPORTED_EXTENSIONS}')
+        
+        try:
+            if ext == '.pdf':
+                return TextExtractor.extract_text_from_pdf(path)
+            elif ext == '.docx':
+                return docx2txt.process(path)
+            elif ext == '.txt':
+                with open(path, 'r', encoding='utf-8') as f:
+                    return f.read()
+        except Exception as e:
+            logger.error(f"Error extracting text from {path}: {e}")
+            raise
+
+
+class SentenceProcessor:
+    """Handles sentence tokenization and preprocessing"""
+    
+    @staticmethod
+    def split_sentences(text: str) -> List[str]:
+        """Split text into sentences using NLTK"""
+        try:
+            sentences = sent_tokenize(text)
+            # Filter out very short sentences
+            sentences = [s.strip() for s in sentences if len(s.strip()) > MIN_SENTENCE_LENGTH]
+            return sentences
+        except Exception as e:
+            logger.error(f"Error splitting sentences: {e}")
+            return []
+
+
+class StylemetryAnalyzer:
+    """Handles stylometry feature extraction"""
+    
+    def __init__(self):
+        try:
+            self.nlp = spacy.load(SPACY_MODEL_NAME)
+            logger.info(f"Loaded spaCy model: {SPACY_MODEL_NAME}")
+        except OSError:
+            logger.warning(f"spaCy model {SPACY_MODEL_NAME} not found. Stylometry features will be limited.")
+            self.nlp = None
+    
+    def extract_features(self, sentence: str) -> Dict[str, float]:
+        """Extract stylometry features from sentence"""
+        if self.nlp is None:
+            return {'flesch_reading_ease': 0.0}
+        
+        try:
+            doc = self.nlp(sentence)
+            features = {}
+            
+            # Token-based features
+            alpha_tokens = [t for t in doc if t.is_alpha]
+            features['num_tokens'] = len(alpha_tokens)
+            features['avg_word_len'] = (sum(len(t.text) for t in alpha_tokens) / 
+                                      max(1, len(alpha_tokens)))
+            
+            # Readability
+            features['flesch_reading_ease'] = textstat.flesch_reading_ease(sentence)
+            
+            # Lexical diversity
+            words = [t.text.lower() for t in alpha_tokens]
+            features['ttr'] = len(set(words)) / max(1, len(words))
+            
+            # Punctuation density
+            features['punct_density'] = len([t for t in doc if t.is_punct]) / max(1, len(doc))
+            
+            # POS ratios
+            pos_counts = {}
+            for token in doc:
+                pos_counts[token.pos_] = pos_counts.get(token.pos_, 0) + 1
+            
+            features['noun_ratio'] = pos_counts.get('NOUN', 0) / max(1, len(doc))
+            features['verb_ratio'] = pos_counts.get('VERB', 0) / max(1, len(doc))
+            
+            return features
+            
+        except Exception as e:
+            logger.error(f"Error extracting stylometry features: {e}")
+            return {'flesch_reading_ease': 0.0}
+
+
+class SemanticSearchEngine:
+    """Handles semantic search using SBERT and FAISS"""
+    
+    def __init__(self):
+        self.model = None
+        self.index = None
+        self.corpus_sentences = []
+        self.model_source = 'unloaded'
+        self.model_path = None
+        self._load_models()
+        
+        # Phase 2: Try to use persistent retrieval system
+        self.use_persistent_retrieval = False
+        self.retrieval_engine = None
+        self._try_load_persistent_retrieval()
+    
+    def _load_models(self):
+        """Load semantic model (fine-tuned preferred if enabled)."""
+        try:
+            candidate_paths = []
+            if USE_FINE_TUNED_MODEL:
+                fine_tuned_config = os.path.join(MODEL_FINE_TUNED_PATH, 'config.json')
+                if os.path.exists(fine_tuned_config):
+                    candidate_paths.append(('fine_tuned', MODEL_FINE_TUNED_PATH))
+            # Always add base as fallback
+            candidate_paths.append(('base', SBERT_MODEL_NAME))
+
+            load_error = None
+            for source, path in candidate_paths:
+                try:
+                    logger.info(f"Attempting to load semantic model ({source}): {path}")
+                    self.model = SentenceTransformer(path)
+                    self.model_source = source
+                    self.model_path = path
+                    logger.info(f"Semantic model loaded: source={source} path={path}")
+                    return
+                except Exception as e:  # pragma: no cover
+                    load_error = e
+                    logger.warning(f"Failed loading {source} model at {path}: {e}")
+                    continue
+            if self.model is None:
+                raise RuntimeError(f"Failed to load any semantic model (last error: {load_error})")
+        except Exception as e:
+            logger.error(f"Error loading semantic model: {e}")
+            self.model = None
+            self.model_source = 'error'
+            
+    def _try_load_persistent_retrieval(self):
+        """Try to load Phase 2 persistent retrieval system"""
+        try:
+            from retrieval import get_retrieval_engine
+            self.retrieval_engine = get_retrieval_engine()
+            
+            if self.retrieval_engine.is_ready():
+                self.use_persistent_retrieval = True
+                logger.info("Using persistent retrieval system (Phase 2)")
+            else:
+                logger.info("Persistent retrieval not ready, using in-memory system (Phase 1)")
+                
+        except ImportError:
+            logger.debug("Phase 2 retrieval system not available")
+        except Exception as e:
+            logger.debug(f"Could not load persistent retrieval: {e}")
+    
+    def build_index(self, corpus_sentences: List[str]):
+        """Build FAISS index from corpus sentences; always retain numpy embeddings for fallback."""
+        if self.use_persistent_retrieval:
+            logger.info("Using persistent retrieval system - skipping in-memory index build")
+            return True
+
+        if self.model is None:
+            logger.error("SBERT model not loaded. Cannot build index.")
+            return False
+
+        try:
+            logger.info(f"Building semantic structures for {len(corpus_sentences)} sentences")
+            self.corpus_sentences = corpus_sentences
+
+            # Encode corpus embeddings
+            corpus_embeddings = self.model.encode(corpus_sentences, convert_to_numpy=True)
+            # Normalize for cosine via dot product
+            norms = np.linalg.norm(corpus_embeddings, axis=1, keepdims=True) + 1e-12
+            corpus_embeddings = corpus_embeddings / norms
+            self._corpus_embeddings = corpus_embeddings  # store for fallback
+
+            if FAISS_AVAILABLE:
+                d = corpus_embeddings.shape[1]
+                self.index = faiss.IndexFlatIP(d)  # type: ignore
+                self.index.add(corpus_embeddings)
+                logger.info(f"FAISS index built with {self.index.ntotal} sentences")
+            else:
+                logger.warning("FAISS not available; will use numpy fallback for similarity search")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error building semantic index structures: {e}")
+            return False
+
+    def _fallback_numpy_search(self, query: str, top_k: int) -> List[Dict]:
+        """Fallback cosine similarity search using stored numpy embeddings."""
+        if self.model is None or not hasattr(self, '_corpus_embeddings'):
+            return []
+        try:
+            q_emb = self.model.encode([query], convert_to_numpy=True)
+            q_emb = q_emb / (np.linalg.norm(q_emb, axis=1, keepdims=True) + 1e-12)
+            sims = np.dot(self._corpus_embeddings, q_emb[0])  # cosine via normalized vectors
+            top_indices = np.argsort(-sims)[:top_k]
+            results = []
+            for idx in top_indices:
+                results.append({'sentence': self.corpus_sentences[idx], 'score': float(sims[idx])})
+            return results
+        except Exception as e:
+            logger.error(f"Fallback numpy search failed: {e}")
+            return []
+    
+    def search(self, query: str, top_k: int = DEFAULT_TOP_K) -> List[Dict]:
+        """Perform semantic search"""
+        # Phase 2: Use persistent retrieval if available
+        if self.use_persistent_retrieval and self.retrieval_engine:
+            try:
+                results = self.retrieval_engine.retrieve_similar_chunks(
+                    [query], top_k=top_k
+                )
+                
+                # Convert to Phase 1 format for compatibility
+                formatted_results = []
+                for result in results:
+                    formatted_results.append({
+                        'sentence': result.text,
+                        'score': float(result.score)
+                    })
+                    
+                return formatted_results
+                
+            except Exception as e:
+                logger.warning(f"Persistent retrieval failed, falling back to in-memory: {e}")
+                # Fall through to Phase 1 implementation
+                
+        # Phase 1: In-memory search
+        if self.model is None:
+            logger.warning("Search engine model not loaded")
+            return []
+        
+        try:
+            if self.index is not None:  # FAISS path
+                query_embedding = self.model.encode([query], convert_to_numpy=True)
+                # normalize
+                query_embedding = query_embedding / (np.linalg.norm(query_embedding, axis=1, keepdims=True) + 1e-12)
+                scores, indices = self.index.search(query_embedding, top_k)  # type: ignore
+                results = []
+                for score, idx in zip(scores[0], indices[0]):
+                    if 0 <= idx < len(self.corpus_sentences):
+                        results.append({'sentence': self.corpus_sentences[idx], 'score': float(score)})
+                return results
+            else:
+                return self._fallback_numpy_search(query, top_k)
+        except Exception as e:
+            logger.warning(f"FAISS search error ({e}); attempting numpy fallback")
+            return self._fallback_numpy_search(query, top_k)
+
+
+class CrossEncoderReranker:
+    """Handles cross-encoder reranking for higher precision"""
+    
+    def __init__(self):
+        self.model = None
+        self._load_model()
+    
+    def _load_model(self):
+        """Load cross-encoder model with resilient failure handling"""
+        try:
+            logger.info(f"Loading cross-encoder model: {CROSS_ENCODER_MODEL_NAME}")
+            self.model = CrossEncoder(CROSS_ENCODER_MODEL_NAME)
+            logger.info("Cross-encoder model loaded successfully")
+        except Exception as e:
+            logger.warning(f"Failed to load cross-encoder model: {e}. Reranking will be disabled.")
+            self.model = None
+    
+    def rerank(self, query: str, candidates: List[str]) -> List[Dict]:
+        """Rerank candidates using cross-encoder"""
+        if self.model is None:
+            logger.warning("Cross-encoder not available. Returning candidates with default scores.")
+            return [{'sentence': s, 'rerank_score': 0.0} for s in candidates]
+        
+        if not candidates:
+            return []
+        
+        try:
+            pairs = [[query, candidate] for candidate in candidates]
+            scores = self.model.predict(pairs)
+            
+            ranked = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
+            return [{'sentence': s, 'rerank_score': float(score)} for s, score in ranked]
+            
+        except Exception as e:
+            logger.error(f"Error in cross-encoder reranking: {e}")
+            return [{'sentence': s, 'rerank_score': 0.0} for s in candidates]
+
+
+class DocumentAnalysisPipeline:
+    """Main pipeline for document analysis"""
+    
+    def __init__(self, corpus_sentences: Optional[List[str]] = None):
+        self.text_extractor = TextExtractor()
+        self.sentence_processor = SentenceProcessor()
+        self.stylometry_analyzer = StylemetryAnalyzer()
+        self.semantic_engine = SemanticSearchEngine()
+        self.reranker = CrossEncoderReranker()
+        self.sentence_classifier = SentenceClassifier()
+        
+        # Use demo corpus if none provided
+        if corpus_sentences is None:
+            if EXTENDED_CORPUS_ENABLED:
+                corpus_sentences = self._get_extended_corpus()
+                logger.info(f"Loaded extended demo corpus with {len(corpus_sentences)} sentences")
+            else:
+                corpus_sentences = self._get_demo_corpus()
+        
+        # Build search index
+        if corpus_sentences:
+            self.semantic_engine.build_index(corpus_sentences)
+    
+    def _get_demo_corpus(self) -> List[str]:
+        """Get demo corpus for testing"""
+        return [
+            "Climate change is a critical global issue that affects agriculture and health.",
+            "The effects of global warming include rising sea levels and more extreme weather.",
+            "Machine learning improves many real world tasks such as image recognition and language modeling.",
+            "Neural networks can approximate complex functions and are widely used in deep learning.",
+            "The French Revolution began in 1789 and led to major political changes in Europe.",
+            "Photosynthesis is the process by which green plants convert sunlight into energy.",
+            "The mitochondrion is the powerhouse of the cell.",
+            "In 1969, Neil Armstrong became the first person to walk on the Moon.",
+            "The capital of France is Paris.",
+            "SQL stands for Structured Query Language and is used to manage relational databases."
+        ]
+
+    def _get_extended_corpus(self) -> List[str]:
+        """Extended demo corpus with additional technical and academic sentences.
+
+        Goal: Provide more diverse matches so a single generic sentence (e.g. the SQL definition)
+        does not dominate all database related queries. These are intentionally concise, neutral
+        factual statements spanning databases, transactions, indexing, algorithms, statistics,
+        research writing, and software engineering.
+        """
+        base = self._get_demo_corpus()
+        extended = [
+            # Database & SQL
+            "A relational database organizes data into tables consisting of rows and columns.",
+            "Database normalization reduces redundancy by organizing fields and table relationships.",
+            "A primary key uniquely identifies each record within a relational table.",
+            "Foreign keys enforce referential integrity between related tables.",
+            "ACID properties ensure reliable transaction processing in database systems.",
+            "Transaction isolation levels balance consistency with concurrency performance.",
+            "Indexes speed up data retrieval operations at the cost of additional storage and write overhead.",
+            "A query optimizer selects an efficient execution plan based on statistics and heuristics.",
+            "Denormalization can improve read performance but risks data anomalies.",
+            "SQL JOIN operations combine rows from multiple tables based on related keys.",
+            # Data engineering / systems
+            "Caching frequently accessed data reduces latency and alleviates database load.",
+            "Horizontal scaling distributes data across multiple nodes for capacity and resilience.",
+            "A message queue decouples producers and consumers enabling asynchronous processing.",
+            "Event driven architectures react to state changes published as immutable records.",
+            # Machine learning & stats
+            "Regularization techniques like L2 penalty help prevent overfitting in models.",
+            "Cross validation provides a robust estimate of model generalization performance.",
+            "Gradient descent iteratively updates parameters to minimize a loss function.",
+            "Precision measures the proportion of retrieved instances that are relevant.",
+            "Recall measures the proportion of relevant instances that were successfully retrieved.",
+            # Academic writing & methodology
+            "The methodology section details data collection and experimental procedures.",
+            "A literature review synthesizes prior research to establish context and gaps.",
+            "Empirical results should report both central tendency and variability metrics.",
+            "Limitations outline factors that may constrain the interpretation of findings.",
+            # Software engineering
+            "Unit tests verify the behavior of individual functions or classes in isolation.",
+            "Continuous integration automatically builds and tests code upon each commit.",
+            "Refactoring improves internal code structure without altering external behavior.",
+            "Version control enables collaborative development with change history tracking.",
+            # Security / reliability
+            "Input validation mitigates common injection vulnerabilities in applications.",
+            "Encryption protects data confidentiality during storage and transmission.",
+            "Monitoring key performance indicators helps detect system regressions early.",
+            # Misc general knowledge
+            "Photosynthesis converts carbon dioxide and water into glucose and oxygen using light energy.",
+            "Mitochondria generate ATP through oxidative phosphorylation in eukaryotic cells.",
+            "Neural network layers transform representations enabling hierarchical feature learning."
+        ]
+        # Ensure uniqueness while preserving order (base first then new items)
+        seen = set()
+        combined: List[str] = []
+        for s in base + extended:
+            if s not in seen:
+                combined.append(s)
+                seen.add(s)
+        return combined
+    
+    def analyze_sentence(self, sentence: str) -> Dict[str, Any]:
+        """Analyze a single sentence for similarity and risk"""
+        try:
+            # Semantic search
+            semantic_results = self.semantic_engine.search(sentence, top_k=DEFAULT_TOP_K)
+            
+            if not semantic_results:
+                return self._empty_sentence_result(sentence)
+            
+            # Extract candidates for reranking
+            candidates = [r['sentence'] for r in semantic_results]
+            
+            # Cross-encoder reranking
+            rerank_results = self.reranker.rerank(sentence, candidates)
+            
+            # Stylometry analysis
+            query_features = self.stylometry_analyzer.extract_features(sentence)
+            candidate_features = [self.stylometry_analyzer.extract_features(c) for c in candidates]
+            
+            # Compute fused scores
+            fused_results = self.sentence_classifier.compute_fused_score(
+                sentence, semantic_results, rerank_results, 
+                query_features, candidate_features
+            )
+            
+            # Classify risk level (now returns risk_level, fused_score, match_strength, reason)
+            risk_level, confidence_score, match_strength, reason = self.sentence_classifier.classify_sentence(fused_results)
+            
+            # Get best match
+            best_match = fused_results[0] if fused_results else {}
+            
+            return {
+                'sentence': sentence,
+                'risk_level': risk_level,
+                'confidence_score': confidence_score,
+                'match_strength': match_strength,
+                'reason': reason,
+                'best_match': best_match.get('candidate', ''),
+                'semantic_score': best_match.get('semantic_score', 0.0),
+                'semantic_norm': best_match.get('semantic_norm', 0.0),
+                'rerank_score': best_match.get('rerank_score', 0.0),
+                'rerank_norm': best_match.get('rerank_norm', 0.0),
+                'stylometry_score': best_match.get('stylometry_score', 0.0),
+                'fused_score': best_match.get('fused_score', 0.0),
+                'components': best_match.get('components', {}),
+                'stylometry_features': query_features,
+                'all_candidates': fused_results[:MAX_CANDIDATES]
+            }
+            
+        except Exception as e:
+            logger.error(f"Error analyzing sentence: {e}")
+            return self._empty_sentence_result(sentence)
+    
+    def _empty_sentence_result(self, sentence: str) -> Dict[str, Any]:
+        """Return empty result for failed sentence analysis"""
+        return {
+            'sentence': sentence,
+            'risk_level': RISK_LEVELS['LOW'],
+            'confidence_score': 0.0,
+            'match_strength': 'NONE',
+            'reason': 'Analysis failed',
+            'best_match': '',
+            'semantic_score': 0.0,
+            'semantic_norm': 0.0,
+            'rerank_score': 0.0,
+            'rerank_norm': 0.0,
+            'stylometry_score': 0.0,
+            'fused_score': 0.0,
+            'components': {},
+            'stylometry_features': {},
+            'all_candidates': []
+        }
+    
+    def analyze_document(self, file_path: str) -> Dict[str, Any]:
+        """Analyze complete document for originality"""
+        try:
+            logger.info(f"Analyzing document: {file_path}")
+            
+            # Extract text
+            text = self.text_extractor.extract_text(file_path)
+            if not text.strip():
+                raise ValueError("Empty document")
+
+            # Optional citation masking (reduces false positives on references)
+            try:
+                from ingestion.citation_mask import CitationMasker  # local import to avoid circular
+                citation_masker = CitationMasker()
+            except Exception:
+                citation_masker = type('NullMasker',(object,),{'enabled':False})()
+            masked_text, citations = text, []
+            citation_summary = {}
+            try:
+                if citation_masker.enabled:
+                    masked_text, citations = citation_masker.mask_citations(text)
+                    citation_summary = citation_masker.get_citation_summary(citations)
+                    logger.info(f"Citation masking applied: {citation_summary.get('total',0)} citations masked")
+            except Exception as ce:
+                logger.warning(f"Citation masking failed, continuing without: {ce}")
+            
+            # Split into sentences
+            sentences = self.sentence_processor.split_sentences(masked_text)
+            if not sentences:
+                raise ValueError("No sentences found in document")
+            
+            logger.info(f"Found {len(sentences)} sentences to analyze")
+            
+            # Analyze each sentence
+            sentence_results = []
+            for i, sentence in enumerate(sentences):
+                if i % 10 == 0:  # Log progress
+                    logger.info(f"Analyzing sentence {i+1}/{len(sentences)}")
+                
+                result = self.analyze_sentence(sentence)
+                sentence_results.append(result)
+
+            # Post-process to dampen repeated identical best_match dominance
+            sentence_results = self._postprocess_repeated_matches(sentence_results)
+            
+            # Perform document-level analysis
+            originality_analysis = analyze_document_originality(sentence_results)
+            
+            # Compile final report
+            report = {
+                'document_path': str(file_path),
+                'total_sentences': len(sentences),
+                'sentence_results': sentence_results,
+                'originality_analysis': originality_analysis,
+                'citations': {
+                    'masking_enabled': citation_masker.enabled,
+                    'summary': citation_summary
+                },
+                'processing_info': {
+                    'semantic_engine_available': self.semantic_engine.model is not None,
+                    'cross_encoder_available': self.reranker.model is not None,
+                    'stylometry_available': self.stylometry_analyzer.nlp is not None,
+                    'semantic_model': {
+                        'source': self.semantic_engine.model_source,
+                        'path': self.semantic_engine.model_path,
+                        'use_fine_tuned_flag': USE_FINE_TUNED_MODEL
+                    },
+                    'reuse_decay': {
+                        'allowance': REUSE_DECAY_ALLOWANCE,
+                        'decay_factor': REUSE_DECAY_FACTOR
+                    }
+                }
+            }
+            
+            logger.info(f"Document analysis completed. Originality score: {originality_analysis['originality_metrics']['originality_score']:.2%}")
+            return report
+            
+        except Exception as e:
+            logger.error(f"Error analyzing document {file_path}: {e}")
+            raise
+
+    def _postprocess_repeated_matches(self, sentence_results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Dampen confidence/risk when the same corpus sentence is reused excessively.
+
+        Heuristic rationale: A very generic corpus fact (e.g. definition of SQL) may appear
+        as top match for many semantically nearby but distinct input sentences. After the first
+        few legitimate reuses, additional occurrences provide diminishing plagiarism evidence.
+
+        Strategy:
+        - Track frequency of each best_match among non-low sentences.
+        - Apply a decay to confidence_score and fused_score beyond an allowance threshold.
+        - Potentially downgrade risk level if decayed score drops below thresholds.
+        - Add explanation tag in 'reason'.
+
+        Parameters (tunable):
+        - allowance = config.REUSE_DECAY_ALLOWANCE (first N unpenalized)
+        - decay_factor = config.REUSE_DECAY_FACTOR applied multiplicatively per extra occurrence
+        - min_confidence_floor: don't reduce below 0 to avoid negatives
+        """
+        allowance = REUSE_DECAY_ALLOWANCE
+        decay_factor = REUSE_DECAY_FACTOR
+        match_counts: Dict[str, int] = {}
+
+        for res in sentence_results:
+            bm = res.get('best_match') or ''
+            if not bm:
+                continue
+            match_counts[bm] = match_counts.get(bm, 0) + 1
+            occurrence = match_counts[bm]
+            if occurrence <= allowance:
+                continue  # no penalty
+            # Compute decay multiplier
+            extra = occurrence - allowance
+            multiplier = decay_factor ** extra
+            original_conf = res.get('confidence_score', 0.0)
+            new_conf = max(0.0, original_conf * multiplier)
+            res['confidence_score'] = new_conf
+            # Adjust fused_score inside best candidate details if present
+            fused = res.get('fused_score', original_conf)
+            res['fused_score'] = max(0.0, fused * multiplier)
+            # Potentially downgrade risk
+            risk = res.get('risk_level', RISK_LEVELS['LOW'])
+            sem_norm = res.get('semantic_norm', 0.0)
+            if risk == RISK_LEVELS['HIGH']:
+                if not (res['fused_score'] >= HIGH_RISK_THRESHOLD and sem_norm >= SEMANTIC_HIGH_FLOOR):
+                    # Fall back to MEDIUM or LOW depending on medium gating
+                    if res['fused_score'] >= MEDIUM_RISK_THRESHOLD and sem_norm >= SEMANTIC_MEDIUM_FLOOR:
+                        res['risk_level'] = RISK_LEVELS['MEDIUM']
+                        res['reason'] += f" | downgraded to MEDIUM due to repeated match ({occurrence} uses)"
+                    else:
+                        res['risk_level'] = RISK_LEVELS['LOW']
+                        res['reason'] += f" | downgraded to LOW due to repeated match ({occurrence} uses)"
+                else:
+                    res['reason'] += f" | high retained after repetition ({occurrence} uses)"
+            elif risk == RISK_LEVELS['MEDIUM']:
+                if not (res['fused_score'] >= MEDIUM_RISK_THRESHOLD and sem_norm >= SEMANTIC_MEDIUM_FLOOR):
+                    res['risk_level'] = RISK_LEVELS['LOW']
+                    res['reason'] += f" | downgraded to LOW due to repeated match ({occurrence} uses)"
+                else:
+                    res['reason'] += f" | medium retained after repetition ({occurrence} uses)"
+            else:
+                # LOW risk - optionally annotate if repetition heavy
+                if occurrence > allowance + 2:
+                    res['reason'] += f" | generic match reused ({occurrence} uses)"
+        return sentence_results
+    
+    def generate_report_files(self, analysis_result: Dict[str, Any], 
+                            output_dir: str = TEMP_DIR) -> Dict[str, str]:
+        """Generate JSON and HTML report files"""
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Generate filenames
+            json_path = os.path.join(output_dir, 'docinsight_report.json')
+            html_path = os.path.join(output_dir, 'docinsight_report.html')
+            
+            # Save JSON report
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(analysis_result, f, indent=2, default=str)
+            
+            # Generate HTML report
+            html_content = self._generate_html_report(analysis_result)
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+            
+            logger.info(f"Reports saved: {json_path}, {html_path}")
+            return {'json': json_path, 'html': html_path}
+            
+        except Exception as e:
+            logger.error(f"Error generating report files: {e}")
+            raise
+    
+    def _generate_html_report(self, analysis_result: Dict[str, Any]) -> str:
+        """Generate HTML report from analysis results"""
+        doc_path = analysis_result.get('document_path', 'Unknown')
+        originality = analysis_result.get('originality_analysis', {})
+        metrics = originality.get('originality_metrics', {})
+        
+        # HTML template
+        html_parts = [
+            f"<html><head><title>DocInsight Report</title></head><body>",
+            f"<h1>DocInsight Originality Report</h1>",
+            f"<p><strong>Document:</strong> {html.escape(doc_path)}</p>",
+            f"<h2>Summary</h2>",
+            f"<p><strong>Originality Score:</strong> {metrics.get('originality_score', 0.0):.1%}</p>",
+            f"<p><strong>Plagiarized Coverage:</strong> {metrics.get('plagiarized_coverage', 0.0):.1%}</p>",
+            f"<p><strong>Risk Spans Found:</strong> {originality.get('total_risk_spans', 0)}</p>",
+        ]
+        
+        # Sentence distribution
+        distribution = metrics.get('sentence_distribution', {})
+        html_parts.append("<h2>Sentence Risk Distribution</h2>")
+        html_parts.append("<ul>")
+        for risk_level, count in distribution.items():
+            html_parts.append(f"<li><strong>{risk_level}:</strong> {count} sentences</li>")
+        html_parts.append("</ul>")
+        
+        # Top risk spans
+        top_spans = originality.get('top_risk_spans', [])
+        if top_spans:
+            html_parts.append("<h2>Top Risk Spans</h2>")
+            for i, span in enumerate(top_spans, 1):
+                html_parts.append(f"<div style='border:1px solid #ddd; margin:10px; padding:10px;'>")
+                html_parts.append(f"<h3>Risk Span {i} ({span['risk_level']})</h3>")
+                html_parts.append(f"<p><strong>Score:</strong> {span['avg_score']:.3f}</p>")
+                html_parts.append(f"<p><strong>Sentences:</strong> {len(span['sentences'])}</p>")
+                html_parts.append(f"<p><strong>Preview:</strong> {html.escape(span.get('preview_text', ''))}</p>")
+                html_parts.append("</div>")
+        
+        # Plagiarism factor components (if present)
+        if 'plagiarism_components' in metrics:
+            comps = metrics['plagiarism_components']
+            html_parts.append("<h2>Plagiarism Factor Components</h2>")
+            html_parts.append("<ul>")
+            html_parts.append(f"<li>Coverage Component: {comps.get('coverage_component',0.0):.4f}</li>")
+            html_parts.append(f"<li>Severity Component: {comps.get('severity_component',0.0):.4f}</li>")
+            html_parts.append(f"<li>Span Ratio Component: {comps.get('span_ratio_component',0.0):.4f}</li>")
+            weights = comps.get('weights', {})
+            html_parts.append(f"<li>Weights: α={weights.get('alpha')}, β={weights.get('beta')}, γ={weights.get('gamma')}</li>")
+            html_parts.append("</ul>")
+            if 'plagiarism_factor' in metrics:
+                html_parts.append(f"<p><strong>Plagiarism Factor:</strong> {metrics.get('plagiarism_factor',0.0):.4f}</p>")
+
+        html_parts.append("</body></html>")
+        return "\n".join(html_parts)
+
+
+# Convenience function for simple document analysis
+def analyze_document_file(file_path: str, corpus_sentences: Optional[List[str]] = None) -> Dict[str, Any]:
+    """
+    Convenience function to analyze a document file
+    
+    Args:
+        file_path: Path to document file
+        corpus_sentences: Optional custom corpus sentences
+        
+    Returns:
+        Complete analysis results
+    """
+    pipeline = DocumentAnalysisPipeline(corpus_sentences)
+    return pipeline.analyze_document(file_path)
