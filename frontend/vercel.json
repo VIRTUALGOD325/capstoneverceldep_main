@@ -6,8 +6,5 @@
     "app/api/analyze/route.ts": {
       "maxDuration": 300
     }
-  },
-  "env": {
-    "BACKEND_URL": "@backend-url"
   }
 }
