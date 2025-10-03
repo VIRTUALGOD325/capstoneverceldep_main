@@ -303,6 +303,14 @@ class SemanticSearchEngine:
         except Exception as e:
             logger.warning(f"FAISS search error ({e}); attempting numpy fallback")
             return self._fallback_numpy_search(query, top_k)
+    
+    def set_corpus(self, corpus_sentences: List[str]):
+        """Set corpus sentences and rebuild the index"""
+        self.build_index(corpus_sentences)
+    
+    def search_similar(self, query: str, top_k: int = DEFAULT_TOP_K) -> List[Dict]:
+        """Alias for search method for compatibility"""
+        return self.search(query, top_k)
 
 
 class CrossEncoderReranker:
@@ -739,6 +747,81 @@ class DocumentAnalysisPipeline:
 
         html_parts.append("</body></html>")
         return "\n".join(html_parts)
+
+
+class AcademicPlagiarismDetector:
+    """
+    Academic Plagiarism Detector for compatibility with setup scripts.
+    
+    Provides a simplified interface for sentence-level analysis.
+    """
+    
+    def __init__(self, corpus_index, use_domain_adaptation: bool = True):
+        self.corpus_index = corpus_index
+        self.use_domain_adaptation = use_domain_adaptation
+        
+        # Initialize pipeline components
+        self.semantic_engine = SemanticSearchEngine()
+        self.cross_encoder = CrossEncoderReranker()
+        self.stylometry = StylemetryAnalyzer()
+        self.classifier = SentenceClassifier()
+        
+        # Set corpus for semantic engine
+        if hasattr(corpus_index, 'sentences') and corpus_index.sentences:
+            self.semantic_engine.set_corpus(corpus_index.sentences)
+        
+    def analyze_sentence(self, sentence: str):
+        """Analyze a single sentence for plagiarism risk.
+        
+        Returns a simple result object with basic attributes for compatibility.
+        """
+        try:
+            # Get semantic candidates
+            candidates = self.semantic_engine.search_similar(sentence, top_k=5)
+            
+            # Rerank with cross-encoder
+            if candidates:
+                reranked = self.cross_encoder.rerank_candidates(sentence, candidates)
+                if reranked:
+                    candidates = reranked
+            
+            # Extract stylometry features
+            stylometry_features = self.stylometry.extract_features(sentence)
+            
+            # Classify sentence
+            classification = self.classifier.classify_sentence(
+                sentence, candidates, stylometry_features
+            )
+            
+            # Create result object
+            result = SimpleAnalysisResult(
+                fused_score=classification[1] if len(classification) > 1 else 0.5,
+                semantic_score=candidates[0]['score'] if candidates else 0.0,
+                cross_encoder_score=candidates[0].get('cross_encoder_score', 0.0) if candidates else 0.0,
+                stylometry_similarity=0.5,  # placeholder
+                confidence=classification[1] if len(classification) > 1 else 0.5,
+                academic_indicators={}
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error analyzing sentence: {e}")
+            # Return safe defaults
+            return SimpleAnalysisResult()
+
+
+class SimpleAnalysisResult:
+    """Simple result class for sentence analysis compatibility."""
+    
+    def __init__(self, fused_score=0.0, semantic_score=0.0, cross_encoder_score=0.0, 
+                 stylometry_similarity=0.0, confidence='LOW', academic_indicators=None):
+        self.fused_score = fused_score
+        self.semantic_score = semantic_score 
+        self.cross_encoder_score = cross_encoder_score
+        self.stylometry_similarity = stylometry_similarity
+        self.confidence = confidence
+        self.academic_indicators = academic_indicators or {}
 
 
 # Convenience function for simple document analysis

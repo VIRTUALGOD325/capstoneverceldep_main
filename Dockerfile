@@ -20,6 +20,10 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Download spaCy model and NLTK data
+RUN python -m spacy download en_core_web_sm
+RUN python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
+
 # Copy project files
 COPY . .
 

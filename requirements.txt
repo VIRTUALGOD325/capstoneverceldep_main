@@ -29,6 +29,10 @@ requests>=2.28.0
 langdetect>=1.0.9
 beautifulsoup4>=4.11.0
 
+# Missing dependencies for DocInsight setup
+datasets>=2.0.0
+wikipedia>=1.4.0
+
 # Optional dependencies for better web content extraction
 readability-lxml>=0.8.1; extra == "web"
 newspaper3k>=0.2.8; extra == "web"

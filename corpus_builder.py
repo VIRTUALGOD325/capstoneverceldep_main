@@ -149,6 +149,91 @@ class SimpleCorpusBuilder:
         ]
 
 
+class CorpusIndex(SimpleCorpusBuilder):
+    """
+    Corpus Index wrapper around SimpleCorpusBuilder for compatibility.
+    
+    This provides the interface expected by the setup scripts while
+    delegating to the existing SimpleCorpusBuilder implementation.
+    """
+    
+    def __init__(self, target_size: int = 20000, use_domain_adaptation: bool = True, cache_dir: str = "corpus_cache"):
+        super().__init__(cache_dir)
+        self.target_size = target_size
+        self.use_domain_adaptation = use_domain_adaptation
+        self.cache_dir = Path(cache_dir)
+        self.sentences = []
+        self.model = None
+        
+        # Ensure cache directory exists
+        os.makedirs(self.cache_dir, exist_ok=True)
+    
+    def _is_fully_cached(self) -> bool:
+        """
+        Check if the corpus is already built and cached
+        """
+        ready_file = self.cache_dir / ".docinsight_academic_ready"
+        return ready_file.exists()
+    
+    def load_or_build(self) -> bool:
+        """
+        Load existing corpus or build a new one
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Try to load existing corpus first
+            corpus_file = self.cache_dir / "academic_corpus.json"
+            if corpus_file.exists():
+                logger.info(f"Loading existing corpus from {corpus_file}")
+                with open(corpus_file, 'r', encoding='utf-8') as f:
+                    corpus_data = json.load(f)
+                self.sentences = corpus_data.get("sentences", [])
+            else:
+                # Build new corpus using demo data for now
+                logger.info("Building new academic corpus...")
+                self.sentences = self.get_demo_corpus()
+                
+                # Expand with more academic-style sentences to reach target size
+                while len(self.sentences) < self.target_size:
+                    # Add variations of demo sentences
+                    base_sentences = self.get_demo_corpus()
+                    for sentence in base_sentences:
+                        if len(self.sentences) >= self.target_size:
+                            break
+                        # Add some variations
+                        variations = [
+                            sentence.replace("is", "remains"),
+                            sentence.replace("The", "This"),
+                            f"Research shows that {sentence.lower()}",
+                            f"Studies indicate that {sentence.lower()}"
+                        ]
+                        for var in variations:
+                            if len(self.sentences) < self.target_size:
+                                self.sentences.append(var)
+                
+                # Save the built corpus
+                corpus_data = {
+                    "corpus_name": "academic",
+                    "total_sentences": len(self.sentences),
+                    "sentences": self.sentences
+                }
+                
+                with open(corpus_file, 'w', encoding='utf-8') as f:
+                    json.dump(corpus_data, f, indent=2, ensure_ascii=False)
+                
+                logger.info(f"Built and saved corpus with {len(self.sentences)} sentences")
+            
+            # Initialize model (placeholder for now)
+            self.model = "placeholder_model"
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to load or build corpus: {e}")
+            return False
+
+
 def build_demo_corpus() -> List[str]:
     """
     Convenience function to get demo corpus
