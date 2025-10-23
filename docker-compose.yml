@@ -1,7 +1,37 @@
 version: '3.8'
 
 services:
-  docinsight-backend:
+  discovery-service:
+    build:
+      context: ./discovery-service
+      dockerfile: Dockerfile
+    ports:
+      - "8761:8761"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8761/actuator/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - EUREKA_SERVER_URL=http://discovery-service:8761/eureka
+    depends_on:
+      discovery-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+
+  analysis-service:
     build:
       context: .
       dockerfile: backend/Dockerfile
@@ -11,19 +41,26 @@ services:
       - LOG_LEVEL=INFO
       - DOCINSIGHT_USE_FINE_TUNED=true
       - DOCINSIGHT_EXTENDED_CORPUS=true
+      - REGISTER_WITH_EUREKA=true
+      - EUREKA_SERVER_URL=http://discovery-service:8761/eureka
+      - SERVICE_NAME=analysis-service
+      - HOST=0.0.0.0
+      - PORT=8000
     volumes:
-      # Mount model directories if they exist
       - ./models:/app/models:ro
       - ./checkpoints:/app/checkpoints:ro
       - ./embeddings:/app/embeddings:ro
       - ./index:/app/index:ro
       - ./indexes:/app/indexes:ro
+    depends_on:
+      discovery-service:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s  # Allow time for models to load
+      start_period: 120s
 
   docinsight-frontend:
     build:
@@ -32,12 +69,153 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - BACKEND_URL=http://docinsight-backend:8000
+      - BACKEND_URL=http://api-gateway:8080/api
     depends_on:
-      docinsight-backend:
+      api-gateway:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000"]
       interval: 30s
       timeout: 10s
       retries: 3
+
+  streamlit-frontend:
+    build:
+      context: .
+      dockerfile: streamlit/Dockerfile
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./models:/app/models:ro
+      - ./checkpoints:/app/checkpoints:ro
+      - ./embeddings:/app/embeddings:ro
+      - ./index:/app/index:ro
+      - ./indexes:/app/indexes:ro
+    depends_on:
+      analysis-service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Additional Spring services
+  scoring-service:
+    build:
+      context: ./scoring-service
+      dockerfile: Dockerfile
+    ports:
+      - "8086:8086"
+    environment:
+      - EUREKA_SERVER_URL=http://discovery-service:8761/eureka
+    depends_on:
+      discovery-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/actuator/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+
+  citation-service:
+    build:
+      context: ./citation-service
+      dockerfile: Dockerfile
+    ports:
+      - "8087:8087"
+    environment:
+      - EUREKA_SERVER_URL=http://discovery-service:8761/eureka
+    depends_on:
+      discovery-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8087/actuator/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+
+  fine-tuning-service:
+    build:
+      context: ./fine-tuning-service
+      dockerfile: Dockerfile
+    ports:
+      - "8088:8088"
+    environment:
+      - EUREKA_SERVER_URL=http://discovery-service:8761/eureka
+    depends_on:
+      discovery-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/actuator/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+
+  user-service:
+    build:
+      context: ./user-service
+      dockerfile: Dockerfile
+    ports:
+      - "8089:8089"
+    environment:
+      - EUREKA_SERVER_URL=http://discovery-service:8761/eureka
+    depends_on:
+      discovery-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8089/actuator/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+
+  notification-service:
+    build:
+      context: ./notification-service
+      dockerfile: Dockerfile
+    ports:
+      - "8090:8090"
+    environment:
+      - EUREKA_SERVER_URL=http://discovery-service:8761/eureka
+    depends_on:
+      discovery-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/actuator/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+
+  audit-service:
+    build:
+      context: ./audit-service
+      dockerfile: Dockerfile
+    ports:
+      - "8091:8091"
+    environment:
+      - EUREKA_SERVER_URL=http://discovery-service:8761/eureka
+    depends_on:
+      discovery-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/actuator/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+
+  model-service:
+    build:
+      context: ./model-service
+      dockerfile: Dockerfile
+    ports:
+      - "8092:8092"
+    environment:
+      - EUREKA_SERVER_URL=http://discovery-service:8761/eureka
+    depends_on:
+      discovery-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8092/actuator/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 10

@@ -16,6 +16,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
+from py_eureka_client import eureka_client
 
 # Add parent directory to path to import DocInsight modules
 sys.path.append(str(Path(__file__).parent.parent))
@@ -62,6 +63,22 @@ async def startup_event():
             logger.info("Cross-encoder reranker available")
         if hasattr(pipeline, 'stylometry') and pipeline.stylometry:
             logger.info("Stylometry analyzer available")
+        
+        # Register with Eureka (optional)
+        try:
+            if os.getenv("REGISTER_WITH_EUREKA", "true").lower() == "true":
+                eureka_server = os.getenv("EUREKA_SERVER_URL", "http://discovery-service:8761/eureka")
+                app_name = os.getenv("SERVICE_NAME", "analysis-service")
+                port = int(os.getenv("PORT", "8000"))
+                eureka_client.init(
+                    eureka_server=eureka_server,
+                    app_name=app_name,
+                    instance_port=port,
+                    prefer_ip_address=True,
+                )
+                logger.info(f"Registered with Eureka at {eureka_server} as {app_name}:{port}")
+        except Exception as er:
+            logger.warning(f"Could not register with Eureka: {er}")
             
     except Exception as e:
         logger.error(f"Failed to initialize DocumentAnalysisPipeline: {e}")

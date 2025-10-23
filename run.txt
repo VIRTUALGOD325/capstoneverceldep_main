@@ -1,0 +1,62 @@
+# DocInsight - Run Guide
+
+This guide covers the fastest ways to run DocInsight. Pick one option.
+
+## Option 1: Docker Compose (all services)
+Prereqs: Docker + Docker Compose
+```bash
+# From project root
+docker-compose up --build -d
+# Check status
+docker-compose ps
+# Stop everything
+docker-compose down
+```
+
+## Option 2: Local Spring microservices (Maven, no Docker)
+Prereqs: Java 17 + Maven
+```bash
+chmod +x scripts/run_all_services.sh
+scripts/run_all_services.sh start     # start Eureka, gateway, and all services
+scripts/run_all_services.sh status    # show status
+scripts/run_all_services.sh logs api-gateway   # tail logs for a service
+scripts/run_all_services.sh stop      # stop all
+```
+Optional:
+```bash
+export EUREKA_SERVER_URL=http://localhost:8761/eureka
+```
+
+## Option 3: Standalone Streamlit UI (optional)
+```bash
+bash run_docinsight.sh
+```
+UI: http://localhost:8501
+
+---
+## Service catalog (ports and health)
+Spring Boot services (health: /actuator/health)
+- discovery-service ........ 8761  -> http://localhost:8761/actuator/health
+- api-gateway .............. 8080  -> http://localhost:8080/actuator/health
+- analysis-service ......... 8085  -> http://localhost:8085/actuator/health
+- scoring-service .......... 8086  -> http://localhost:8086/actuator/health
+- citation-service ......... 8087  -> http://localhost:8087/actuator/health
+- fine-tuning-service ...... 8088  -> http://localhost:8088/actuator/health
+- user-service ............. 8089  -> http://localhost:8089/actuator/health
+- notification-service ..... 8090  -> http://localhost:8090/actuator/health
+- audit-service ............ 8091  -> http://localhost:8091/actuator/health
+- model-service ............ 8092  -> http://localhost:8092/actuator/health
+
+Other apps
+- frontend ................. 3000  -> http://localhost:3000
+- streamlit-app (optional).. 8501  -> http://localhost:8501
+
+Common URLs
+- API Gateway:       http://localhost:8080
+- Eureka Dashboard:  http://localhost:8761
+
+---
+## Troubleshooting (quick)
+- Port conflicts: ensure listed ports are free or update configs.
+- Health checks: wait for /actuator/health = UP before using a service.
+- Docker issues: restart Docker Desktop, then re-run Option 1.
