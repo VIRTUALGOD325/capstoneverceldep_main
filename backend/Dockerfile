@@ -1,30 +1,33 @@
-FROM python:3.9-slim
+FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# System deps
 RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
-COPY backend/requirements.txt backend/requirements.txt
+# Install CPU-only PyTorch first (saves ~500MB vs default CUDA build)
+RUN pip install --no-cache-dir \
+    torch==2.1.0 --extra-index-url https://download.pytorch.org/whl/cpu
+
+# Install remaining requirements
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/requirements.txt backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
-# Download required NLTK data
-RUN python -c "import nltk; nltk.download('punkt')"
+# Download model data at build time (faster cold start)
+RUN python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
+RUN python -m spacy download en_core_web_sm
 
-# Copy the application code
+# Copy application code
 COPY . .
 
-# Set environment variables
 ENV PYTHONPATH=/app
 ENV PORT=8000
 
-# Expose the port
 EXPOSE 8000
 
-# Start the server
 CMD ["python", "backend/main.py"]
